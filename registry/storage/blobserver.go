@@ -49,39 +49,37 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		// Fallback to serving the content directly.
 	}
 
-	var content io.ReadSeekCloser
-	// Pass *os.File directly so net/http can use the sendfile system call.
-	// The buffered fileReader hides the file from net/http.
-	if canUseFileFastPath(r) && bs.driver.Name() == "filesystem" {
+	br, err := newFileReader(ctx, bs.driver, path, desc.Size)
+	if err != nil {
+		return err
+	}
+	defer br.Close()
+
+	var blobReader io.ReadSeeker = br
+	if canUseDirectFile(r) && bs.driver.Name() == "filesystem" {
 		rc, err := bs.driver.Reader(ctx, path, 0)
 		if err != nil {
 			return err
 		}
-		if f, ok := rc.(*os.File); ok {
-			info, err := f.Stat()
+		file, ok := rc.(*os.File)
+		if !ok {
+			// Use fileReader to preserve seeking when middleware hides *os.File.
+			rc.Close()
+		} else {
+			defer file.Close()
+			info, err := file.Stat()
 			if err != nil {
-				f.Close()
 				return fmt.Errorf("stat blob %s: %w", desc.Digest, err)
 			}
 			// ServeContent uses the file size instead of the descriptor size.
 			// Blobs must remain immutable while the response uses this open file.
 			if info.Size() != desc.Size {
-				f.Close()
 				return fmt.Errorf("blob %s size mismatch: descriptor %d, file %d", desc.Digest, desc.Size, info.Size())
 			}
-			content = f
-		} else {
-			// Use fileReader to preserve seeking when middleware hides *os.File.
-			rc.Close()
+			// Keep *os.File visible to net/http so it can use the sendfile system call.
+			blobReader = file
 		}
 	}
-	if content == nil {
-		content, err = newFileReader(ctx, bs.driver, path, desc.Size)
-		if err != nil {
-			return err
-		}
-	}
-	defer content.Close()
 
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, desc.Digest)) // If-None-Match handled by ServeContent
 	w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%.f", blobCacheControlMaxAge.Seconds()))
@@ -100,15 +98,16 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		w.Header().Set("Content-Length", fmt.Sprint(desc.Size))
 	}
 
-	http.ServeContent(w, r, desc.Digest.String(), time.Time{}, content)
+	http.ServeContent(w, r, desc.Digest.String(), time.Time{}, blobReader)
 	return nil
 }
 
-func canUseFileFastPath(r *http.Request) bool {
-	// HEAD and failed preconditions need metadata but can return without opening storage.
+func canUseDirectFile(r *http.Request) bool {
+	// Only GET requests send blob data; other methods do not need an open file.
 	if r.Method != http.MethodGet {
 		return false
 	}
+	// ServeContent may return HTTP 304 or 412 without reading the blob, so keep file opening lazy.
 	for _, name := range [...]string{"If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since"} {
 		if r.Header.Get(name) != "" {
 			return false
