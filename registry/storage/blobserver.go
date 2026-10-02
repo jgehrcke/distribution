@@ -3,7 +3,9 @@ package storage
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/distribution/distribution/v3"
@@ -47,11 +49,39 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		// Fallback to serving the content directly.
 	}
 
-	br, err := newFileReader(ctx, bs.driver, path, desc.Size)
-	if err != nil {
-		return err
+	var content io.ReadSeekCloser
+	// Pass *os.File directly so net/http can use the sendfile system call.
+	// The buffered fileReader hides the file from net/http.
+	if canUseFileFastPath(r) && bs.driver.Name() == "filesystem" {
+		rc, err := bs.driver.Reader(ctx, path, 0)
+		if err != nil {
+			return err
+		}
+		if f, ok := rc.(*os.File); ok {
+			info, err := f.Stat()
+			if err != nil {
+				f.Close()
+				return fmt.Errorf("stat blob %s: %w", desc.Digest, err)
+			}
+			// ServeContent uses the file size instead of the descriptor size.
+			// Blobs must remain immutable while the response uses this open file.
+			if info.Size() != desc.Size {
+				f.Close()
+				return fmt.Errorf("blob %s size mismatch: descriptor %d, file %d", desc.Digest, desc.Size, info.Size())
+			}
+			content = f
+		} else {
+			// Use fileReader to preserve seeking when middleware hides *os.File.
+			rc.Close()
+		}
 	}
-	defer br.Close()
+	if content == nil {
+		content, err = newFileReader(ctx, bs.driver, path, desc.Size)
+		if err != nil {
+			return err
+		}
+	}
+	defer content.Close()
 
 	w.Header().Set("ETag", fmt.Sprintf(`"%s"`, desc.Digest)) // If-None-Match handled by ServeContent
 	w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%.f", blobCacheControlMaxAge.Seconds()))
@@ -70,6 +100,20 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		w.Header().Set("Content-Length", fmt.Sprint(desc.Size))
 	}
 
-	http.ServeContent(w, r, desc.Digest.String(), time.Time{}, br)
+	http.ServeContent(w, r, desc.Digest.String(), time.Time{}, content)
 	return nil
+}
+
+func canUseFileFastPath(r *http.Request) bool {
+	// HEAD and failed preconditions need metadata but can return without opening storage.
+	if r.Method != http.MethodGet {
+		return false
+	}
+	for _, name := range [...]string{"If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since"} {
+		if r.Header.Get(name) != "" {
+			return false
+		}
+	}
+	// If-Range still requires the blob because either outcome sends a body.
+	return true
 }
