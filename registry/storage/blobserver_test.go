@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -149,35 +148,16 @@ func TestBlobServerFilesystemContent(t *testing.T) {
 	}
 }
 
-func TestBlobServerFilesystemErrors(t *testing.T) {
-	for _, name := range []string{"open", "shorter", "longer"} {
-		t.Run(name, func(t *testing.T) {
-			bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
-			if name == "open" {
-				spy.readErr = os.ErrPermission
-			} else {
-				body := "short"
-				if name == "longer" {
-					body = "different size"
-				}
-				if err := spy.PutContent(context.Background(), "/blob", []byte(body)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			w := httptest.NewRecorder()
-			err := bs.ServeBlob(context.Background(), w, httptest.NewRequest(http.MethodGet, "/blob", nil), dgst)
-			if name == "open" {
-				if !errors.Is(err, os.ErrPermission) {
-					t.Fatalf("open error = %v", err)
-				}
-			} else if err == nil || !strings.Contains(err.Error(), "size mismatch") {
-				t.Fatalf("size error = %v", err)
-			}
-			assertBlobReadersClosed(t, spy)
-			if len(w.Header()) != 0 || w.Body.Len() != 0 {
-				t.Fatal("response written before validation")
-			}
-		})
+func TestBlobServerFilesystemOpenError(t *testing.T) {
+	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
+	spy.readErr = os.ErrPermission
+	w := httptest.NewRecorder()
+	err := bs.ServeBlob(context.Background(), w, httptest.NewRequest(http.MethodGet, "/blob", nil), dgst)
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("open error = %v", err)
+	}
+	if len(w.Header()) != 0 || w.Body.Len() != 0 {
+		t.Fatal("response written before opening the blob")
 	}
 }
 

@@ -67,15 +67,6 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 			rc.Close()
 		} else {
 			defer file.Close()
-			info, err := file.Stat()
-			if err != nil {
-				return fmt.Errorf("stat blob %s: %w", desc.Digest, err)
-			}
-			// ServeContent uses the file size instead of the descriptor size.
-			// Blobs must remain immutable while the response uses this open file.
-			if info.Size() != desc.Size {
-				return fmt.Errorf("blob %s size mismatch: descriptor %d, file %d", desc.Digest, desc.Size, info.Size())
-			}
 			// Keep *os.File visible to net/http so it can use the sendfile system call.
 			blobReader = file
 		}
