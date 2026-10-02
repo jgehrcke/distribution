@@ -238,9 +238,10 @@ func (irw *instrumentedResponseWriter) ReadFrom(r io.Reader) (int64, error) {
 	n, err := rf.ReadFrom(r)
 
 	irw.mu.Lock()
-	// ReadFrom can copy bytes before returning an error.
+	// Count copied bytes even when ReadFrom returns an error.
+	// Record implicit HTTP 200 so status 0 does not suppress the "response completed" log.
+	// A zero-byte copy may leave the HTTP status unset.
 	irw.written += n
-	// Empty reads and errors can return before the writer sets a status.
 	if irw.status == 0 && n > 0 {
 		irw.status = http.StatusOK
 	}
