@@ -94,14 +94,14 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 }
 
 // shouldUseDirectFile reports whether the request should use the blob file directly with ServeContent.
-// Only GET requests without If-Match, If-Unmodified-Since, If-None-Match, or If-Modified-Since qualify.
-// These exclusions avoid opening a file for responses that may need no file contents.
+// ETag preconditions can produce HTTP 304 or 412 without reading file contents.
+// ServeContent ignores date preconditions because ServeBlob passes a zero modification time.
 // Range and If-Range remain eligible because they do not cause HTTP 304 or 412 responses.
 func shouldUseDirectFile(r *http.Request) bool {
 	if r.Method != http.MethodGet {
 		return false
 	}
-	for _, name := range [...]string{"If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since"} {
+	for _, name := range [...]string{"If-Match", "If-None-Match"} {
 		if r.Header.Get(name) != "" {
 			return false
 		}
