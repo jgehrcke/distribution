@@ -63,7 +63,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		}
 		file, ok := rc.(*os.File)
 		if !ok {
-			// Use fileReader to preserve seeking when middleware hides *os.File.
+			// Use the original fileReader when middleware hides the file object.
 			rc.Close()
 		} else {
 			defer file.Close()
