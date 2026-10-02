@@ -56,7 +56,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 	defer br.Close()
 
 	var blobReader io.ReadSeeker = br
-	if canUseDirectFile(r) && bs.driver.Name() == "filesystem" {
+	if shouldUseDirectFile(r) && bs.driver.Name() == "filesystem" {
 		rc, err := bs.driver.Reader(ctx, path, 0)
 		if err != nil {
 			return err
@@ -93,17 +93,18 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 	return nil
 }
 
-func canUseDirectFile(r *http.Request) bool {
-	// Only GET requests send blob data; other methods do not need an open file.
+// shouldUseDirectFile reports whether the request should use the blob file directly with ServeContent.
+// Only GET requests without If-Match, If-Unmodified-Since, If-None-Match, or If-Modified-Since qualify.
+// These exclusions avoid opening a file for responses that may need no file contents.
+// Range and If-Range remain eligible because they do not cause HTTP 304 or 412 responses.
+func shouldUseDirectFile(r *http.Request) bool {
 	if r.Method != http.MethodGet {
 		return false
 	}
-	// ServeContent may return HTTP 304 or 412 without reading the blob, so keep file opening lazy.
 	for _, name := range [...]string{"If-Match", "If-Unmodified-Since", "If-None-Match", "If-Modified-Since"} {
 		if r.Header.Get(name) != "" {
 			return false
 		}
 	}
-	// If-Range still requires the blob because either outcome sends a body.
 	return true
 }
