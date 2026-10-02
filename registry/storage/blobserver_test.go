@@ -94,17 +94,22 @@ func assertBlobReadersClosed(t *testing.T, spy *blobReaderSpy) {
 
 func TestBlobServerFilesystemContent(t *testing.T) {
 	for _, tc := range []struct {
-		name, method, rangeHeader, precondition, ifRange, wantBody string
-		wantStatus, wantReads                                      int
-		wantFile                                                   bool
+		name, method, rangeHeader, ifRange, wantBody string
+		precondition, preconditionValue              string
+		wantStatus, wantReads                        int
+		wantFile                                     bool
 	}{
 		{name: "full", method: http.MethodGet, wantBody: "0123456789", wantStatus: http.StatusOK, wantReads: 1, wantFile: true},
 		{name: "range", method: http.MethodGet, rangeHeader: "bytes=2-5", wantBody: "2345", wantStatus: http.StatusPartialContent, wantReads: 1, wantFile: true},
 		{name: "if-range-match", method: http.MethodGet, rangeHeader: "bytes=2-5", ifRange: "match", wantBody: "2345", wantStatus: http.StatusPartialContent, wantReads: 1, wantFile: true},
 		{name: "if-range-mismatch", method: http.MethodGet, rangeHeader: "bytes=2-5", ifRange: `"other"`, wantBody: "0123456789", wantStatus: http.StatusOK, wantReads: 1, wantFile: true},
 		{name: "head", method: http.MethodHead, wantStatus: http.StatusOK},
-		{name: "not-modified", method: http.MethodGet, precondition: "If-None-Match", wantStatus: http.StatusNotModified},
-		{name: "failed-precondition", method: http.MethodGet, precondition: "If-Match", wantStatus: http.StatusPreconditionFailed},
+		{name: "not-modified", method: http.MethodGet, precondition: "If-None-Match", preconditionValue: "match", wantStatus: http.StatusNotModified},
+		{name: "failed-precondition", method: http.MethodGet, precondition: "If-Match", preconditionValue: `"other"`, wantStatus: http.StatusPreconditionFailed},
+		{name: "if-match-pass", method: http.MethodGet, precondition: "If-Match", preconditionValue: "match", wantBody: "0123456789", wantStatus: http.StatusOK, wantReads: 1},
+		{name: "if-none-match-pass", method: http.MethodGet, precondition: "If-None-Match", preconditionValue: `"other"`, wantBody: "0123456789", wantStatus: http.StatusOK, wantReads: 1},
+		{name: "if-modified-since-ignored", method: http.MethodGet, precondition: "If-Modified-Since", preconditionValue: "Fri, 01 Jan 2100 00:00:00 GMT", wantBody: "0123456789", wantStatus: http.StatusOK, wantReads: 1, wantFile: true},
+		{name: "if-unmodified-since-ignored", method: http.MethodGet, precondition: "If-Unmodified-Since", preconditionValue: "Mon, 02 Jan 2006 15:04:05 GMT", wantBody: "0123456789", wantStatus: http.StatusOK, wantReads: 1, wantFile: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
@@ -117,11 +122,12 @@ func TestBlobServerFilesystemContent(t *testing.T) {
 				}
 				req.Header.Set("If-Range", value)
 			}
-			if tc.precondition == "If-None-Match" {
-				req.Header.Set(tc.precondition, `"`+dgst.String()+`"`)
-			}
-			if tc.precondition == "If-Match" {
-				req.Header.Set(tc.precondition, `"other"`)
+			if tc.precondition != "" {
+				value := tc.preconditionValue
+				if value == "match" {
+					value = `"` + dgst.String() + `"`
+				}
+				req.Header.Set(tc.precondition, value)
 			}
 			probe := &fileBodyProbe{ResponseRecorder: httptest.NewRecorder()}
 			ctx, w := dcontext.WithResponseWriter(context.Background(), probe)
