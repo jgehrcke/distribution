@@ -93,9 +93,11 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 	return nil
 }
 
-// shouldUseDirectFile reports whether the request should use the blob file directly with ServeContent.
-// ETag preconditions can produce HTTP 304 or 412 without reading file contents.
-// ServeContent ignores date preconditions because ServeBlob passes a zero modification time.
+// shouldUseDirectFile reports whether ServeContent should receive the blob file directly.
+// Exclude If-Match and If-None-Match so ServeContent can return HTTP 304 or 412 without opening the file.
+// ServeBlob sets the ETag from desc.Digest, which identifies the blob validated during upload.
+// ServeContent compares the client's header with that ETag without reading file contents.
+// ServeBlob passes time.Time{} to ServeContent, so it ignores If-Modified-Since and If-Unmodified-Since.
 // Range and If-Range remain eligible because they do not cause HTTP 304 or 412 responses.
 func shouldUseDirectFile(r *http.Request) bool {
 	if r.Method != http.MethodGet {
