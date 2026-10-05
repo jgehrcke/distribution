@@ -56,6 +56,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 	defer br.Close()
 
 	var blobReader io.ReadSeeker = br
+	// Check the driver name before calling Reader() to avoid unnecessary object-storage requests.
 	if shouldUseDirectFile(r) && bs.driver.Name() == "filesystem" {
 		rc, err := bs.driver.Reader(ctx, path, 0)
 		if err != nil {
