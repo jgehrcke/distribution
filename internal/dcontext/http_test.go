@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/gorilla/handlers"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestWithRequest(t *testing.T) {
@@ -301,6 +304,51 @@ func TestWithResponseWriterGorillaLogging(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWithResponseWriterOpenTelemetryAccounting(t *testing.T) {
+	const body = "0123456789"
+	trw := &testReaderFromResponseWriter{}
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	h := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, rw := WithResponseWriter(r.Context(), w)
+		rw.WriteHeader(http.StatusOK)
+		// CopyN selects ReadFrom even though strings.Reader implements WriterTo.
+		if _, err := io.CopyN(rw, strings.NewReader(body), int64(len(body))); err != nil {
+			t.Fatal(err)
+		}
+		if got := ctx.Value("http.response.written"); got != int64(len(body)) || trw.written != int64(len(body)) {
+			t.Fatalf("Distribution bytes = %v, response bytes = %d, want %d", got, trw.written, len(body))
+		}
+	}), "blob", otelhttp.WithMeterProvider(provider))
+	h.ServeHTTP(trw, httptest.NewRequest(http.MethodGet, "/blob", nil))
+	var metrics metricdata.ResourceMetrics
+	if err := reader.Collect(Background(), &metrics); err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range metrics.ScopeMetrics {
+		for _, metric := range scope.Metrics {
+			if metric.Name != "http.server.response.body.size" {
+				continue
+			}
+			histogram, ok := metric.Data.(metricdata.Histogram[int64])
+			if !ok || len(histogram.DataPoints) != 1 {
+				t.Fatalf("unexpected response body histogram: %#v", metric.Data)
+			}
+			point := histogram.DataPoints[0]
+			if point.Count != 1 || point.Sum != int64(len(body)) {
+				t.Errorf("OpenTelemetry response body histogram: count=%d sum=%d, want count=1 sum=%d (response bytes = %d)", point.Count, point.Sum, len(body), trw.written)
+			}
+			return
+		}
+	}
+	t.Fatal("http.server.response.body.size metric missing")
 }
 
 func TestWithVars(t *testing.T) {
