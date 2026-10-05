@@ -66,6 +66,13 @@ func (h loggingHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 func makeLogger(w http.ResponseWriter) (*responseLogger, http.ResponseWriter) {
 	logger := &responseLogger{w: w, status: http.StatusOK}
 	return logger, httpsnoop.Wrap(w, httpsnoop.Hooks{
+		ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+			return func(r io.Reader) (int64, error) {
+				n, err := next(r)
+				logger.size += int(n)
+				return n, err
+			}
+		},
 		Write: func(httpsnoop.WriteFunc) httpsnoop.WriteFunc {
 			return logger.Write
 		},
