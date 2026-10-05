@@ -69,6 +69,9 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		} else {
 			defer file.Close()
 			// Keep *os.File visible to net/http so it can use the sendfile system call.
+			// ServeContent determines the length by seeking to the end of the open file,
+			// rather than using desc.Size from the possibly cached blob statter.
+			// These sizes should agree because validated blobs are assumed immutable.
 			blobReader = file
 		}
 	}
