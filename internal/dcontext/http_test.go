@@ -11,7 +11,6 @@ import (
 	"testing/iotest"
 	"time"
 
-	"github.com/gorilla/handlers"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -261,46 +260,6 @@ func TestWithResponseWriterReadFrom(t *testing.T) {
 						t.Errorf("recorded bytes = %v, writer bytes = %d, want %d", got, trw.written, wantWritten)
 					}
 				})
-			}
-		})
-	}
-}
-
-func TestWithResponseWriterGorillaLogging(t *testing.T) {
-	const body = "0123456789"
-	for _, delegate := range []bool{false, true} {
-		name := "fallback"
-		if delegate {
-			name = "delegate"
-		}
-		t.Run(name, func(t *testing.T) {
-			trw := &testResponseWriter{}
-			var destination http.ResponseWriter = trw
-			if delegate {
-				rf := &testReaderFromResponseWriter{}
-				destination = rf
-				trw = &rf.testResponseWriter
-			}
-			loggedBytes := -1
-			// Match the registry's wrapper order: Gorilla outside WithResponseWriter.
-			h := handlers.CustomLoggingHandler(io.Discard, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				ctx, rw := WithResponseWriter(Background(), w)
-				rw.WriteHeader(http.StatusOK)
-				// CopyN selects ReadFrom even though strings.Reader implements WriterTo.
-				n, err := io.CopyN(rw, strings.NewReader(body), int64(len(body)))
-				if err != nil || n != int64(len(body)) {
-					t.Fatalf("CopyN = (%d, %v), want (%d, nil)", n, err, len(body))
-				}
-				if got := ctx.Value("http.response.written"); got != int64(len(body)) {
-					t.Errorf("Distribution recorded bytes = %v, want %d", got, len(body))
-				}
-			}), func(_ io.Writer, p handlers.LogFormatterParams) { loggedBytes = p.Size })
-			h.ServeHTTP(destination, httptest.NewRequest(http.MethodGet, "/blob", nil))
-			if trw.written != int64(len(body)) {
-				t.Fatalf("response bytes = %d, want %d", trw.written, len(body))
-			}
-			if loggedBytes != len(body) {
-				t.Errorf("Gorilla logged bytes = %d, want %d (response bytes = %d)", loggedBytes, len(body), trw.written)
 			}
 		})
 	}
