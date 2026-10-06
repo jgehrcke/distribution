@@ -121,16 +121,16 @@ func (w *RespWriterWrapper) ReadFrom(r io.Reader) (int64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if !w.wroteHeader {
-		w.writeHeader(http.StatusOK)
-	}
-
 	rf, ok := w.ResponseWriter.(io.ReaderFrom)
 	if !ok {
 		return 0, errors.New("ResponseWriter does not implement io.ReaderFrom")
 	}
 
 	n, err := rf.ReadFrom(r)
+	// net/http commits the status (200 if unset) on the first copied byte, not before.
+	if n > 0 {
+		w.wroteHeader = true
+	}
 	w.OnWrite(n)
 	w.written += n
 	w.err = err
