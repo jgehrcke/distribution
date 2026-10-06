@@ -172,6 +172,25 @@ func TestBlobServerFilesystemWrappedReader(t *testing.T) {
 	}
 }
 
+type nonFilesystemDriver struct{ *blobReaderSpy }
+
+func (nonFilesystemDriver) Name() string { return "non-filesystem" }
+
+func TestBlobServerNonFilesystemReader(t *testing.T) {
+	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
+	spy.wrap = func(rc io.ReadCloser) io.ReadCloser { return struct{ io.ReadCloser }{rc} }
+	bs.driver = nonFilesystemDriver{spy}
+	probe := &fileBodyProbe{ResponseRecorder: httptest.NewRecorder()}
+	if err := bs.ServeBlob(context.Background(), probe, httptest.NewRequest(http.MethodGet, "/blob", nil), dgst); err != nil {
+		t.Fatal(err)
+	}
+	assertBlobReadersClosed(t, spy)
+	// Non-filesystem drivers must avoid a speculative Reader call before the lazy read.
+	if spy.reads != 1 || probe.sawFile || probe.Code != http.StatusOK || probe.Body.String() != "0123456789" {
+		t.Fatalf("Reader calls = %d, file source = %t, response = %d %q", spy.reads, probe.sawFile, probe.Code, probe.Body.String())
+	}
+}
+
 func TestBlobServerFilesystemHTTP(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
