@@ -14,6 +14,8 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestWithRequest(t *testing.T) {
@@ -308,6 +310,77 @@ func TestWithResponseWriterOpenTelemetryAccounting(t *testing.T) {
 		}
 	}
 	t.Fatal("http.server.response.body.size metric missing")
+}
+
+// readerFromResponseRecorder retains ResponseRecorder's first-status behavior
+// while exposing the ReadFrom path used by net/http.
+type readerFromResponseRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (w *readerFromResponseRecorder) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(w.ResponseRecorder, r)
+}
+
+func TestWithResponseWriterOpenTelemetryStatus(t *testing.T) {
+	readErr := errors.New("source failed")
+	for _, tc := range []struct {
+		name       string
+		body       string
+		readErr    error
+		wantStatus int
+	}{
+		{name: "error-before-bytes", readErr: readErr, wantStatus: http.StatusInternalServerError},
+		{name: "empty-response", wantStatus: http.StatusNoContent},
+		{name: "partial-error", body: "part", readErr: readErr, wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter := tracetest.NewInMemoryExporter()
+			provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+			t.Cleanup(func() {
+				if err := provider.Shutdown(Background()); err != nil {
+					t.Error(err)
+				}
+			})
+			h := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, rw := WithResponseWriter(r.Context(), w)
+				var source io.Reader = strings.NewReader(tc.body)
+				copySize := int64(len(tc.body))
+				if tc.readErr != nil {
+					source = io.MultiReader(source, iotest.ErrReader(tc.readErr))
+					copySize++
+				}
+				// CopyN selects ReadFrom without committing a response status first.
+				n, err := io.CopyN(rw, source, copySize)
+				if n != int64(len(tc.body)) || !errors.Is(err, tc.readErr) {
+					t.Fatalf("CopyN = (%d, %v), want (%d, %v)", n, err, len(tc.body), tc.readErr)
+				}
+				if err != nil {
+					rw.WriteHeader(http.StatusInternalServerError)
+				} else if n == 0 {
+					rw.WriteHeader(http.StatusNoContent)
+				}
+			}), "blob", otelhttp.WithTracerProvider(provider))
+			w := &readerFromResponseRecorder{httptest.NewRecorder()}
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/blob", nil))
+			if w.Code != tc.wantStatus || w.Body.String() != tc.body {
+				t.Errorf("response = (%d, %q), want (%d, %q)", w.Code, w.Body.String(), tc.wantStatus, tc.body)
+			}
+			spans := exporter.GetSpans()
+			if len(spans) != 1 {
+				t.Fatalf("recorded spans = %d, want 1", len(spans))
+			}
+			var spanStatus int64
+			for _, attr := range spans[0].Attributes {
+				if attr.Key == "http.response.status_code" {
+					spanStatus = attr.Value.AsInt64()
+				}
+			}
+			if spanStatus != int64(tc.wantStatus) {
+				t.Errorf("OpenTelemetry status = %d, want %d", spanStatus, tc.wantStatus)
+			}
+		})
+	}
 }
 
 func TestWithVars(t *testing.T) {
