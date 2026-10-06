@@ -57,7 +57,10 @@ func (pbs *proxyBlobStore) copyContent(ctx context.Context, dgst digest.Digest, 
 
 	defer remoteReader.Close()
 
-	_, err = io.CopyN(writer, remoteReader, desc.Size)
+	// Hide io.ReaderFrom: with Prometheus metrics enabled, promhttp's ReadFrom
+	// sets status 200 before copying, so an upstream error before the first
+	// byte would reach the client as 200 instead of an error status.
+	_, err = io.CopyN(struct{ io.Writer }{writer}, remoteReader, desc.Size)
 	if err != nil {
 		return v1.Descriptor{}, err
 	}
