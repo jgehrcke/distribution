@@ -12,8 +12,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
@@ -267,51 +265,6 @@ func TestWithResponseWriterReadFrom(t *testing.T) {
 	}
 }
 
-func TestWithResponseWriterOpenTelemetryAccounting(t *testing.T) {
-	const body = "0123456789"
-	trw := &testReaderFromResponseWriter{}
-	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	t.Cleanup(func() {
-		if err := provider.Shutdown(Background()); err != nil {
-			t.Error(err)
-		}
-	})
-	h := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, rw := WithResponseWriter(r.Context(), w)
-		rw.WriteHeader(http.StatusOK)
-		// CopyN selects ReadFrom even though strings.Reader implements WriterTo.
-		if _, err := io.CopyN(rw, strings.NewReader(body), int64(len(body))); err != nil {
-			t.Fatal(err)
-		}
-		if got := ctx.Value("http.response.written"); got != int64(len(body)) || trw.written != int64(len(body)) {
-			t.Fatalf("Distribution bytes = %v, response bytes = %d, want %d", got, trw.written, len(body))
-		}
-	}), "blob", otelhttp.WithMeterProvider(provider))
-	h.ServeHTTP(trw, httptest.NewRequest(http.MethodGet, "/blob", nil))
-	var metrics metricdata.ResourceMetrics
-	if err := reader.Collect(Background(), &metrics); err != nil {
-		t.Fatal(err)
-	}
-	for _, scope := range metrics.ScopeMetrics {
-		for _, metric := range scope.Metrics {
-			if metric.Name != "http.server.response.body.size" {
-				continue
-			}
-			histogram, ok := metric.Data.(metricdata.Histogram[int64])
-			if !ok || len(histogram.DataPoints) != 1 {
-				t.Fatalf("unexpected response body histogram: %#v", metric.Data)
-			}
-			point := histogram.DataPoints[0]
-			if point.Count != 1 || point.Sum != int64(len(body)) {
-				t.Errorf("OpenTelemetry response body histogram: count=%d sum=%d, want count=1 sum=%d (response bytes = %d)", point.Count, point.Sum, len(body), trw.written)
-			}
-			return
-		}
-	}
-	t.Fatal("http.server.response.body.size metric missing")
-}
-
 // readerFromResponseRecorder retains ResponseRecorder's first-status behavior
 // while exposing the ReadFrom path used by net/http.
 type readerFromResponseRecorder struct {
@@ -370,14 +323,17 @@ func TestWithResponseWriterOpenTelemetryStatus(t *testing.T) {
 			if len(spans) != 1 {
 				t.Fatalf("recorded spans = %d, want 1", len(spans))
 			}
-			var spanStatus int64
+			var spanStatus, spanBytes int64
 			for _, attr := range spans[0].Attributes {
-				if attr.Key == "http.response.status_code" {
+				switch attr.Key {
+				case "http.response.status_code":
 					spanStatus = attr.Value.AsInt64()
+				case "http.response.body.size":
+					spanBytes = attr.Value.AsInt64()
 				}
 			}
-			if spanStatus != int64(tc.wantStatus) {
-				t.Errorf("OpenTelemetry status = %d, want %d", spanStatus, tc.wantStatus)
+			if spanStatus != int64(tc.wantStatus) || spanBytes != int64(len(tc.body)) {
+				t.Errorf("OpenTelemetry status, bytes = %d, %d, want %d, %d", spanStatus, spanBytes, tc.wantStatus, len(tc.body))
 			}
 		})
 	}
