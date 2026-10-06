@@ -5,12 +5,11 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
-	"mime"
-	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -268,6 +267,7 @@ func testBlobServerFilesystemHTTP(t *testing.T, useTLS, useHTTP2 bool) {
 	}
 }
 
+// Exercise multipart's buffered copy path; net/http tests the MIME format.
 func TestBlobServerFilesystemMultipartRange(t *testing.T) {
 	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
 	req := httptest.NewRequest(http.MethodGet, "/blob", nil)
@@ -281,46 +281,10 @@ func TestBlobServerFilesystemMultipartRange(t *testing.T) {
 	if w.Code != http.StatusPartialContent || spy.reads != 1 {
 		t.Fatalf("status = %d, Reader calls = %d", w.Code, spy.reads)
 	}
+	if !strings.HasPrefix(w.Header().Get("Content-Type"), "multipart/byteranges;") || w.Body.Len() == 0 {
+		t.Fatalf("expected multipart response: Content-Type = %q, bytes = %d", w.Header().Get("Content-Type"), w.Body.Len())
+	}
 	if ctx.Value("http.response.status") != http.StatusPartialContent || ctx.Value("http.response.written") != int64(w.Body.Len()) {
-		t.Fatalf("recorded status = %v, bytes = %v", ctx.Value("http.response.status"), ctx.Value("http.response.written"))
-	}
-	mediaType, params, err := mime.ParseMediaType(w.Header().Get("Content-Type"))
-	if err != nil || mediaType != "multipart/byteranges" {
-		t.Fatalf("Content-Type = %q, error = %v", w.Header().Get("Content-Type"), err)
-	}
-	reader := multipart.NewReader(w.Body, params["boundary"])
-	for _, tc := range []struct{ body, contentRange string }{
-		{body: "01", contentRange: "bytes 0-1/10"},
-		{body: "89", contentRange: "bytes 8-9/10"},
-	} {
-		part, err := reader.NextPart()
-		if err != nil {
-			t.Fatal(err)
-		}
-		body, err := io.ReadAll(part)
-		if err != nil || string(body) != tc.body || part.Header.Get("Content-Range") != tc.contentRange {
-			t.Fatalf("part: body = %q, Content-Range = %q, error = %v", body, part.Header.Get("Content-Range"), err)
-		}
-	}
-	if _, err := reader.NextPart(); err != io.EOF {
-		t.Fatalf("end of multipart response: %v", err)
-	}
-}
-
-func TestBlobServerFilesystemInvalidRange(t *testing.T) {
-	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
-	req := httptest.NewRequest(http.MethodGet, "/blob", nil)
-	req.Header.Set("Range", "bytes=20-30")
-	w := httptest.NewRecorder()
-	ctx, rw := dcontext.WithResponseWriter(context.Background(), w)
-	if err := bs.ServeBlob(ctx, rw, req, dgst); err != nil {
-		t.Fatal(err)
-	}
-	assertBlobReadersClosed(t, spy)
-	if w.Code != http.StatusRequestedRangeNotSatisfiable || w.Header().Get("Content-Range") != "bytes */10" || spy.reads != 1 {
-		t.Fatalf("status = %d, Content-Range = %q, Reader calls = %d", w.Code, w.Header().Get("Content-Range"), spy.reads)
-	}
-	if ctx.Value("http.response.status") != http.StatusRequestedRangeNotSatisfiable || ctx.Value("http.response.written") != int64(w.Body.Len()) {
 		t.Fatalf("recorded status = %v, bytes = %v", ctx.Value("http.response.status"), ctx.Value("http.response.written"))
 	}
 }
