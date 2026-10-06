@@ -2,12 +2,15 @@ package registry
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	gorhandlers "github.com/gorilla/handlers"
 )
@@ -66,21 +69,44 @@ func (r *readerFromRecorder) ReadFrom(src io.Reader) (int64, error) {
 // are logged and that ReadFrom is still delegated to the wrapped writer.
 func TestAccessLogCountsReadFrom(t *testing.T) {
 	const body = "0123456789"
-	h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		// Hide WriteTo so io.Copy uses the writer's ReadFrom, as for *os.File.
-		_, _ = io.Copy(w, struct{ io.Reader }{strings.NewReader(body)})
-	})
-	var out bytes.Buffer
-	rec := &readerFromRecorder{ResponseRecorder: httptest.NewRecorder()}
-	accessLogHandler(&out, h).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/", nil))
+	for _, tc := range []struct {
+		name, prefix string
+		readErr      error
+	}{
+		{name: "read-from"},
+		{name: "mixed", prefix: "pre-"},
+		{name: "partial-error", readErr: io.ErrUnexpectedEOF},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.prefix != "" {
+					_, _ = w.Write([]byte(tc.prefix))
+				}
+				var src io.Reader = strings.NewReader(body)
+				if tc.readErr != nil {
+					src = io.MultiReader(src, iotest.ErrReader(tc.readErr))
+				}
+				// Hide WriteTo so io.Copy uses the writer's ReadFrom, as for *os.File.
+				n, err := io.Copy(w, struct{ io.Reader }{src})
+				if n != int64(len(body)) || !errors.Is(err, tc.readErr) {
+					t.Errorf("copy = %d, %v; want %d, %v", n, err, len(body), tc.readErr)
+				}
+			})
+			var out bytes.Buffer
+			rec := &readerFromRecorder{ResponseRecorder: httptest.NewRecorder()}
+			accessLogHandler(&out, h).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/", nil))
 
-	if rec.readFromCalls != 1 {
-		t.Errorf("ReadFrom calls = %d, want 1", rec.readFromCalls)
-	}
-	if rec.Body.String() != body {
-		t.Errorf("body = %q, want %q", rec.Body.String(), body)
-	}
-	if !strings.Contains(out.String(), `" 200 10 "`) {
-		t.Errorf("log line does not report status 200 and 10 bytes: %q", out.String())
+			if rec.readFromCalls != 1 {
+				t.Errorf("ReadFrom calls = %d, want 1", rec.readFromCalls)
+			}
+			wantBody := tc.prefix + body
+			if rec.Body.String() != wantBody {
+				t.Errorf("body = %q, want %q", rec.Body.String(), wantBody)
+			}
+			want := fmt.Sprintf(`" 200 %d "`, len(wantBody))
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("log line does not contain %q: %q", want, out.String())
+			}
+		})
 	}
 }
