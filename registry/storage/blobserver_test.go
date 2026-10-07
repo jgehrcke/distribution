@@ -158,6 +158,23 @@ func TestBlobServerFilesystemOpenError(t *testing.T) {
 	}
 }
 
+// A blob file missing after Stat must fail before HTTP 200 is committed;
+// the lazy fileReader would serve an empty body with the descriptor length.
+func TestBlobServerFilesystemMissingFile(t *testing.T) {
+	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
+	if err := spy.Delete(context.Background(), "/blob"); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	err := bs.ServeBlob(context.Background(), w, httptest.NewRequest(http.MethodGet, "/blob", nil), dgst)
+	if !errors.As(err, new(driver.PathNotFoundError)) {
+		t.Fatalf("missing file error = %v", err)
+	}
+	if len(w.Header()) != 0 || w.Body.Len() != 0 {
+		t.Fatal("response written for a missing blob file")
+	}
+}
+
 func TestBlobServerFilesystemWrappedReader(t *testing.T) {
 	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
 	spy.wrap = func(rc io.ReadCloser) io.ReadCloser { return struct{ io.ReadCloser }{rc} }
