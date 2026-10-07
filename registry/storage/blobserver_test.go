@@ -5,9 +5,11 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	"github.com/distribution/distribution/v3/internal/dcontext"
@@ -188,8 +190,41 @@ func TestBlobServerNonFilesystemReader(t *testing.T) {
 	}
 }
 
-// Copy a range through a real socket, where Linux can use sendfile. The range
-// starts mid-file and exceeds net/http's initial buffered copy.
+// fileHandoffListener records whether net/http passes the blob file to
+// TCPConn.ReadFrom, where Go selects sendfile.
+type fileHandoffListener struct {
+	net.Listener
+	sawFile *atomic.Bool
+}
+
+func (l fileHandoffListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if tcp, ok := c.(*net.TCPConn); ok {
+		return fileHandoffConn{tcp, l.sawFile}, nil
+	}
+	return c, err
+}
+
+type fileHandoffConn struct {
+	*net.TCPConn
+	sawFile *atomic.Bool
+}
+
+func (c fileHandoffConn) ReadFrom(r io.Reader) (int64, error) {
+	src := r
+	if limited, ok := r.(*io.LimitedReader); ok {
+		src = limited.R
+	}
+	if _, ok := src.(*os.File); ok {
+		c.sawFile.Store(true)
+	}
+	// Delegate the original reader so the real copy path still runs.
+	return c.TCPConn.ReadFrom(r)
+}
+
+// Copy a range through a real socket and check that the blob file reaches
+// TCPConn.ReadFrom. The range starts mid-file and exceeds net/http's initial
+// buffered copy.
 func TestBlobServerFilesystemHTTP(t *testing.T) {
 	payload := make([]byte, 64*1024)
 	// Use varied data so incorrect range offsets change the response body.
@@ -200,13 +235,16 @@ func TestBlobServerFilesystemHTTP(t *testing.T) {
 	body := string(payload)
 	bs, spy, dgst := newFilesystemBlobServer(t, body)
 	written := make(chan any, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var sawFile atomic.Bool
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, w := dcontext.WithResponseWriter(r.Context(), w)
 		if err := bs.ServeBlob(ctx, w, r, dgst); err != nil {
 			t.Error(err)
 		}
 		written <- ctx.Value("http.response.written")
 	}))
+	server.Listener = fileHandoffListener{server.Listener, &sawFile}
+	server.Start()
 	defer server.Close()
 	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
 	if err != nil {
@@ -225,6 +263,9 @@ func TestBlobServerFilesystemHTTP(t *testing.T) {
 	}
 	if got := <-written; got != int64(len(wantBody)) {
 		t.Errorf("recorded bytes = %v, want %d", got, len(wantBody))
+	}
+	if !sawFile.Load() {
+		t.Error("blob file did not reach TCPConn.ReadFrom")
 	}
 	assertBlobReadersClosed(t, spy)
 }
