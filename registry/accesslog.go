@@ -44,6 +44,7 @@ func accessLogHandler(out io.Writer, h http.Handler) http.Handler {
 					n, err := next(src)
 					written += n
 					// A zero-byte copy can leave the response uncommitted.
+					// See https://github.com/felixge/httpsnoop/issues/42.
 					wroteHeader = wroteHeader || n > 0
 					return n, err
 				}
