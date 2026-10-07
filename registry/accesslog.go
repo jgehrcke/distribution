@@ -15,13 +15,42 @@ import (
 // accessLogHandler logs requests to out in Apache Combined Log Format, like
 // gorilla/handlers.CombinedLoggingHandler. Gorilla counts response bytes only
 // in Write and logs zero bytes for responses copied through io.ReaderFrom,
-// which net/http uses for sendfile. httpsnoop.CaptureMetrics counts both
-// paths and still delegates ReadFrom to the wrapped writer.
+// which net/http uses for sendfile. httpsnoop.Wrap preserves ReadFrom while
+// the hooks count bytes and track the first committed response status.
 func accessLogHandler(out io.Writer, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ts, u := time.Now(), *r.URL
-		m := httpsnoop.CaptureMetrics(h, w, r)
-		_, _ = out.Write(combinedLogLine(r, u, ts, m.Code, m.Written))
+		status, written := http.StatusOK, int64(0)
+		var wroteHeader bool
+		w = httpsnoop.Wrap(w, httpsnoop.Hooks{
+			WriteHeader: func(next httpsnoop.WriteHeaderFunc) httpsnoop.WriteHeaderFunc {
+				return func(code int) {
+					next(code)
+					if !wroteHeader && code >= 200 {
+						status, wroteHeader = code, true
+					}
+				}
+			},
+			Write: func(next httpsnoop.WriteFunc) httpsnoop.WriteFunc {
+				return func(p []byte) (int, error) {
+					n, err := next(p)
+					written += int64(n)
+					wroteHeader = true
+					return n, err
+				}
+			},
+			ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
+				return func(src io.Reader) (int64, error) {
+					n, err := next(src)
+					written += n
+					// A zero-byte copy can leave the response uncommitted.
+					wroteHeader = wroteHeader || n > 0
+					return n, err
+				}
+			},
+		})
+		h.ServeHTTP(w, r)
+		_, _ = out.Write(combinedLogLine(r, u, ts, status, written))
 	})
 }
 

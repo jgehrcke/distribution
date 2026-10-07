@@ -70,26 +70,33 @@ func (r *readerFromRecorder) ReadFrom(src io.Reader) (int64, error) {
 func TestAccessLogCountsReadFrom(t *testing.T) {
 	const body = "0123456789"
 	for _, tc := range []struct {
-		name, prefix string
-		readErr      error
+		name, prefix, body          string
+		readErr                     error
+		afterCopyStatus, wantStatus int
 	}{
-		{name: "read-from"},
-		{name: "mixed", prefix: "pre-"},
-		{name: "partial-error", readErr: io.ErrUnexpectedEOF},
+		{name: "read-from", body: body, wantStatus: http.StatusOK},
+		{name: "mixed", prefix: "pre-", body: body, wantStatus: http.StatusOK},
+		{name: "partial-error", body: body, readErr: io.ErrUnexpectedEOF, afterCopyStatus: http.StatusInternalServerError, wantStatus: http.StatusOK},
+		{name: "error-before-bytes", readErr: io.ErrUnexpectedEOF, afterCopyStatus: http.StatusInternalServerError, wantStatus: http.StatusInternalServerError},
+		{name: "empty", afterCopyStatus: http.StatusNoContent, wantStatus: http.StatusNoContent},
+		{name: "empty-after-write", prefix: "pre-", afterCopyStatus: http.StatusInternalServerError, wantStatus: http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				if tc.prefix != "" {
 					_, _ = w.Write([]byte(tc.prefix))
 				}
-				var src io.Reader = strings.NewReader(body)
+				var src io.Reader = strings.NewReader(tc.body)
 				if tc.readErr != nil {
 					src = io.MultiReader(src, iotest.ErrReader(tc.readErr))
 				}
 				// Hide WriteTo so io.Copy uses the writer's ReadFrom, as for *os.File.
 				n, err := io.Copy(w, struct{ io.Reader }{src})
-				if n != int64(len(body)) || !errors.Is(err, tc.readErr) {
-					t.Errorf("copy = %d, %v; want %d, %v", n, err, len(body), tc.readErr)
+				if n != int64(len(tc.body)) || !errors.Is(err, tc.readErr) {
+					t.Errorf("copy = %d, %v; want %d, %v", n, err, len(tc.body), tc.readErr)
+				}
+				if tc.afterCopyStatus != 0 {
+					w.WriteHeader(tc.afterCopyStatus)
 				}
 			})
 			var out bytes.Buffer
@@ -99,11 +106,11 @@ func TestAccessLogCountsReadFrom(t *testing.T) {
 			if rec.readFromCalls != 1 {
 				t.Errorf("ReadFrom calls = %d, want 1", rec.readFromCalls)
 			}
-			wantBody := tc.prefix + body
-			if rec.Body.String() != wantBody {
-				t.Errorf("body = %q, want %q", rec.Body.String(), wantBody)
+			wantBody := tc.prefix + tc.body
+			if rec.Code != tc.wantStatus || rec.Body.String() != wantBody {
+				t.Errorf("response = %d %q, want %d %q", rec.Code, rec.Body.String(), tc.wantStatus, wantBody)
 			}
-			want := fmt.Sprintf(`" 200 %d "`, len(wantBody))
+			want := fmt.Sprintf(`" %d %d "`, tc.wantStatus, len(wantBody))
 			if !strings.Contains(out.String(), want) {
 				t.Errorf("log line does not contain %q: %q", want, out.String())
 			}
