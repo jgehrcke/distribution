@@ -104,13 +104,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 // ServeBlob passes time.Time{} to ServeContent, so it ignores If-Modified-Since and If-Unmodified-Since.
 // Range and If-Range remain eligible because they do not cause HTTP 304 or 412 responses.
 func shouldUseDirectFile(r *http.Request) bool {
-	if r.Method != http.MethodGet {
-		return false
-	}
-	for _, name := range [...]string{"If-Match", "If-None-Match"} {
-		if r.Header.Get(name) != "" {
-			return false
-		}
-	}
-	return true
+	return r.Method == http.MethodGet &&
+		r.Header.Get("If-Match") == "" &&
+		r.Header.Get("If-None-Match") == ""
 }
