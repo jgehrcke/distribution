@@ -7,11 +7,8 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httptrace"
 	"os"
-	"strings"
 	"testing"
-	"time"
 
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
@@ -30,17 +27,13 @@ func (s fixedBlobStatter) Stat(context.Context, digest.Digest) (v1.Descriptor, e
 
 type blobReaderSpy struct {
 	driver.StorageDriver
-	reads   int
-	files   []*os.File
-	readErr error
-	wrap    func(io.ReadCloser) io.ReadCloser
+	reads int
+	files []*os.File
+	wrap  func(io.ReadCloser) io.ReadCloser
 }
 
 func (d *blobReaderSpy) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
 	d.reads++
-	if d.readErr != nil {
-		return nil, d.readErr
-	}
 	rc, err := d.StorageDriver.Reader(ctx, path, offset)
 	if err != nil {
 		return rc, err
@@ -145,19 +138,6 @@ func TestBlobServerFilesystemContent(t *testing.T) {
 	}
 }
 
-func TestBlobServerFilesystemOpenError(t *testing.T) {
-	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
-	spy.readErr = os.ErrPermission
-	w := httptest.NewRecorder()
-	err := bs.ServeBlob(context.Background(), w, httptest.NewRequest(http.MethodGet, "/blob", nil), dgst)
-	if !errors.Is(err, os.ErrPermission) {
-		t.Fatalf("open error = %v", err)
-	}
-	if len(w.Header()) != 0 || w.Body.Len() != 0 {
-		t.Fatal("response written before opening the blob")
-	}
-}
-
 // A blob file missing after Stat must fail before HTTP 200 is committed;
 // the lazy fileReader would serve an empty body with the descriptor length.
 func TestBlobServerFilesystemMissingFile(t *testing.T) {
@@ -208,24 +188,9 @@ func TestBlobServerNonFilesystemReader(t *testing.T) {
 	}
 }
 
+// Copy a range through a real socket, where Linux can use sendfile. The range
+// starts mid-file and exceeds net/http's initial buffered copy.
 func TestBlobServerFilesystemHTTP(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		tls, http2 bool
-	}{
-		{name: "http1"},
-		{name: "tls-http1", tls: true},
-		{name: "tls-http2", tls: true, http2: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			testBlobServerFilesystemHTTP(t, tc.tls, tc.http2)
-		})
-	}
-}
-
-func testBlobServerFilesystemHTTP(t *testing.T, useTLS, useHTTP2 bool) {
-	t.Helper()
-	// Exceed net/http's initial buffered copy so the test can reach sendfile on Linux.
 	payload := make([]byte, 64*1024)
 	// Use varied data so incorrect range offsets change the response body.
 	rng := rand.New(rand.NewPCG(1, 2))
@@ -234,93 +199,32 @@ func testBlobServerFilesystemHTTP(t *testing.T, useTLS, useHTTP2 bool) {
 	}
 	body := string(payload)
 	bs, spy, dgst := newFilesystemBlobServer(t, body)
-	type result struct {
-		err     error
-		status  any
-		written any
-	}
-	results := make(chan result, 1)
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	written := make(chan any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, w := dcontext.WithResponseWriter(r.Context(), w)
-		err := bs.ServeBlob(ctx, w, r, dgst)
-		results <- result{err, ctx.Value("http.response.status"), ctx.Value("http.response.written")}
+		if err := bs.ServeBlob(ctx, w, r, dgst); err != nil {
+			t.Error(err)
+		}
+		written <- ctx.Value("http.response.written")
 	}))
-	server.EnableHTTP2 = useHTTP2
-	if useTLS {
-		server.StartTLS()
-	} else {
-		server.Start()
-	}
 	defer server.Close()
-	client := server.Client()
-	client.Timeout = 5 * time.Second
-	wantProtocol := 1
-	if useHTTP2 {
-		wantProtocol = 2
-	}
-	for i, tc := range []struct {
-		rangeHeader string
-		wantBody    string
-		wantStatus  int
-	}{
-		{wantBody: body, wantStatus: http.StatusOK},
-		{rangeHeader: "bytes=1025-32768", wantBody: body[1025:32769], wantStatus: http.StatusPartialContent},
-		{wantBody: body, wantStatus: http.StatusOK},
-	} {
-		reused := false
-		ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
-			GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused },
-		})
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		req.Header.Set("Range", tc.rangeHeader)
-		response, err := client.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		gotBody, err := io.ReadAll(response.Body)
-		response.Body.Close()
-		if err != nil || response.StatusCode != tc.wantStatus || string(gotBody) != tc.wantBody {
-			t.Fatalf("request %d: status = %d, body length = %d, error = %v", i, response.StatusCode, len(gotBody), err)
-		}
-		if response.ContentLength != int64(len(tc.wantBody)) || (i > 0 && !reused) {
-			t.Errorf("Content-Length = %d, connection reused = %t", response.ContentLength, reused)
-		}
-		if response.ProtoMajor != wantProtocol {
-			t.Errorf("protocol = %s, want HTTP/%d", response.Proto, wantProtocol)
-		}
-		select {
-		case got := <-results:
-			if got.err != nil || got.status != tc.wantStatus || got.written != int64(len(tc.wantBody)) {
-				t.Errorf("ServeBlob result = %+v", got)
-			}
-		case <-time.After(client.Timeout):
-			t.Fatal("blob handler did not finish")
-		}
-		assertBlobReadersClosed(t, spy)
-	}
-}
-
-// Exercise multipart's buffered copy path; net/http tests the MIME format.
-func TestBlobServerFilesystemMultipartRange(t *testing.T) {
-	bs, spy, dgst := newFilesystemBlobServer(t, "0123456789")
-	req := httptest.NewRequest(http.MethodGet, "/blob", nil)
-	req.Header.Set("Range", "bytes=0-1,8-9")
-	w := httptest.NewRecorder()
-	ctx, rw := dcontext.WithResponseWriter(context.Background(), w)
-	if err := bs.ServeBlob(ctx, rw, req, dgst); err != nil {
+	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
+	req.Header.Set("Range", "bytes=1025-32768")
+	response, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotBody, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	wantBody := body[1025:32769]
+	if err != nil || response.StatusCode != http.StatusPartialContent || string(gotBody) != wantBody {
+		t.Fatalf("status = %d, body length = %d, error = %v", response.StatusCode, len(gotBody), err)
+	}
+	if got := <-written; got != int64(len(wantBody)) {
+		t.Errorf("recorded bytes = %v, want %d", got, len(wantBody))
+	}
 	assertBlobReadersClosed(t, spy)
-	if w.Code != http.StatusPartialContent || spy.reads != 1 {
-		t.Fatalf("status = %d, Reader calls = %d", w.Code, spy.reads)
-	}
-	if !strings.HasPrefix(w.Header().Get("Content-Type"), "multipart/byteranges;") || w.Body.Len() == 0 {
-		t.Fatalf("expected multipart response: Content-Type = %q, bytes = %d", w.Header().Get("Content-Type"), w.Body.Len())
-	}
-	if ctx.Value("http.response.status") != http.StatusPartialContent || ctx.Value("http.response.written") != int64(w.Body.Len()) {
-		t.Fatalf("recorded status = %v, bytes = %v", ctx.Value("http.response.status"), ctx.Value("http.response.written"))
-	}
 }

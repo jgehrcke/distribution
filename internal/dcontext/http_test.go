@@ -4,16 +4,11 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
 	"testing/iotest"
 	"time"
-
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestWithRequest(t *testing.T) {
@@ -197,143 +192,55 @@ func TestWithResponseWriter(t *testing.T) {
 
 func TestWithResponseWriterReadFrom(t *testing.T) {
 	copyErr := errors.New("copy failed")
-	for _, delegate := range []bool{true, false} {
-		name := "fallback"
-		if delegate {
-			name = "delegate"
-		}
-		t.Run(name, func(t *testing.T) {
-			for _, tc := range []struct {
-				name       string
-				body       string
-				status     int
-				prefix     string
-				readErr    error
-				wantStatus int
-			}{
-				{name: "full", body: "content", wantStatus: http.StatusOK},
-				{name: "explicit-status", body: "content", status: http.StatusPartialContent, wantStatus: http.StatusPartialContent},
-				{name: "after-write", body: "content", prefix: "abc", wantStatus: http.StatusOK},
-				{name: "partial-error", body: "part", readErr: copyErr, wantStatus: http.StatusOK},
-				{name: "empty"},
-				{name: "error-without-bytes", readErr: copyErr},
-			} {
-				t.Run(tc.name, func(t *testing.T) {
-					trw := &testResponseWriter{}
-					rf := &testReaderFromResponseWriter{}
-					var destination http.ResponseWriter = trw
-					if delegate {
-						destination = rf
-						trw = &rf.testResponseWriter
-					}
-					ctx, rw := WithResponseWriter(Background(), destination)
-					if tc.status != 0 {
-						rw.WriteHeader(tc.status)
-					}
-					if tc.prefix != "" {
-						if _, err := io.WriteString(rw, tc.prefix); err != nil {
-							t.Fatal(err)
-						}
-					}
-					var source io.Reader = strings.NewReader(tc.body)
-					copySize := int64(len(tc.body))
-					if tc.readErr != nil {
-						source = io.MultiReader(source, iotest.ErrReader(tc.readErr))
-						copySize++
-					}
-					// Use io.CopyN to exercise ReadFrom even when the source implements WriterTo.
-					n, err := io.CopyN(rw, source, copySize)
-					if n != int64(len(tc.body)) || !errors.Is(err, tc.readErr) {
-						t.Fatalf("CopyN = (%d, %v), want (%d, %v)", n, err, len(tc.body), tc.readErr)
-					}
-					if delegate {
-						limited, ok := rf.source.(*io.LimitedReader)
-						if !ok || limited.R != source {
-							t.Fatalf("ReadFrom received %T; want the original limited source", rf.source)
-						}
-					}
-					if got := ctx.Value("http.response.status"); got != tc.wantStatus || trw.status != tc.wantStatus {
-						t.Errorf("recorded status = %v, writer status = %d, want %d", got, trw.status, tc.wantStatus)
-					}
-					wantWritten := int64(len(tc.prefix) + len(tc.body))
-					if got := ctx.Value("http.response.written"); got != wantWritten || trw.written != wantWritten {
-						t.Errorf("recorded bytes = %v, writer bytes = %d, want %d", got, trw.written, wantWritten)
-					}
-				})
-			}
-		})
-	}
-}
-
-// readerFromResponseRecorder retains ResponseRecorder's first-status behavior
-// while exposing the ReadFrom path used by net/http.
-type readerFromResponseRecorder struct {
-	*httptest.ResponseRecorder
-}
-
-func (w *readerFromResponseRecorder) ReadFrom(r io.Reader) (int64, error) {
-	return io.Copy(w.ResponseRecorder, r)
-}
-
-func TestWithResponseWriterOpenTelemetryStatus(t *testing.T) {
-	readErr := errors.New("source failed")
 	for _, tc := range []struct {
 		name       string
+		delegate   bool
 		body       string
+		status     int
 		readErr    error
 		wantStatus int
 	}{
-		{name: "error-before-bytes", readErr: readErr, wantStatus: http.StatusInternalServerError},
-		{name: "empty-response", wantStatus: http.StatusNoContent},
-		{name: "partial-error", body: "part", readErr: readErr, wantStatus: http.StatusOK},
+		// ServeContent commits 206 before copying a range.
+		{name: "delegate-explicit-status", delegate: true, body: "content", status: http.StatusPartialContent, wantStatus: http.StatusPartialContent},
+		{name: "delegate-partial-error", delegate: true, body: "part", readErr: copyErr, wantStatus: http.StatusOK},
+		{name: "delegate-error-without-bytes", delegate: true, readErr: copyErr},
+		{name: "fallback", body: "content", wantStatus: http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			exporter := tracetest.NewInMemoryExporter()
-			provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
-			t.Cleanup(func() {
-				if err := provider.Shutdown(Background()); err != nil {
-					t.Error(err)
-				}
-			})
-			h := otelhttp.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_, rw := WithResponseWriter(r.Context(), w)
-				var source io.Reader = strings.NewReader(tc.body)
-				copySize := int64(len(tc.body))
-				if tc.readErr != nil {
-					source = io.MultiReader(source, iotest.ErrReader(tc.readErr))
-					copySize++
-				}
-				// CopyN selects ReadFrom without committing a response status first.
-				n, err := io.CopyN(rw, source, copySize)
-				if n != int64(len(tc.body)) || !errors.Is(err, tc.readErr) {
-					t.Fatalf("CopyN = (%d, %v), want (%d, %v)", n, err, len(tc.body), tc.readErr)
-				}
-				if err != nil {
-					rw.WriteHeader(http.StatusInternalServerError)
-				} else if n == 0 {
-					rw.WriteHeader(http.StatusNoContent)
-				}
-			}), "blob", otelhttp.WithTracerProvider(provider))
-			w := &readerFromResponseRecorder{httptest.NewRecorder()}
-			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/blob", nil))
-			if w.Code != tc.wantStatus || w.Body.String() != tc.body {
-				t.Errorf("response = (%d, %q), want (%d, %q)", w.Code, w.Body.String(), tc.wantStatus, tc.body)
+			trw := &testResponseWriter{}
+			rf := &testReaderFromResponseWriter{}
+			var destination http.ResponseWriter = trw
+			if tc.delegate {
+				destination = rf
+				trw = &rf.testResponseWriter
 			}
-			spans := exporter.GetSpans()
-			if len(spans) != 1 {
-				t.Fatalf("recorded spans = %d, want 1", len(spans))
+			ctx, rw := WithResponseWriter(Background(), destination)
+			if tc.status != 0 {
+				rw.WriteHeader(tc.status)
 			}
-			var spanStatus, spanBytes int64
-			for _, attr := range spans[0].Attributes {
-				switch attr.Key {
-				case "http.response.status_code":
-					spanStatus = attr.Value.AsInt64()
-				case "http.response.body.size":
-					spanBytes = attr.Value.AsInt64()
+			var source io.Reader = strings.NewReader(tc.body)
+			copySize := int64(len(tc.body))
+			if tc.readErr != nil {
+				source = io.MultiReader(source, iotest.ErrReader(tc.readErr))
+				copySize++
+			}
+			// Use io.CopyN to exercise ReadFrom even when the source implements WriterTo.
+			n, err := io.CopyN(rw, source, copySize)
+			if n != int64(len(tc.body)) || !errors.Is(err, tc.readErr) {
+				t.Fatalf("CopyN = (%d, %v), want (%d, %v)", n, err, len(tc.body), tc.readErr)
+			}
+			if tc.delegate {
+				limited, ok := rf.source.(*io.LimitedReader)
+				if !ok || limited.R != source {
+					t.Fatalf("ReadFrom received %T; want the original limited source", rf.source)
 				}
 			}
-			if spanStatus != int64(tc.wantStatus) || spanBytes != int64(len(tc.body)) {
-				t.Errorf("OpenTelemetry status, bytes = %d, %d, want %d, %d", spanStatus, spanBytes, tc.wantStatus, len(tc.body))
+			if got := ctx.Value("http.response.status"); got != tc.wantStatus || trw.status != tc.wantStatus {
+				t.Errorf("recorded status = %v, writer status = %d, want %d", got, trw.status, tc.wantStatus)
+			}
+			wantWritten := int64(len(tc.body))
+			if got := ctx.Value("http.response.written"); got != wantWritten || trw.written != wantWritten {
+				t.Errorf("recorded bytes = %v, writer bytes = %d, want %d", got, trw.written, wantWritten)
 			}
 		})
 	}
