@@ -10,7 +10,6 @@ import (
 
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/filesystem"
-	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -55,38 +54,40 @@ func TestBlobServerFilesystemFileSize(t *testing.T) {
 	}
 }
 
-type readerCallCounter struct {
+type readerCallRecorder struct {
 	driver.StorageDriver
-	calls int
+	offsets []int64
 }
 
-func (d *readerCallCounter) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-	d.calls++
+func (d *readerCallRecorder) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
+	d.offsets = append(d.offsets, offset)
 	return d.StorageDriver.Reader(ctx, path, offset)
 }
 
-// For a driver other than the filesystem driver, ServeBlob does not call
-// Reader itself: the only call per GET is fileReader's.
-func TestBlobServerOtherDriverReaderCalls(t *testing.T) {
+func TestBlobServerDriverWithoutReadSeeker(t *testing.T) {
 	const content = "0123456789"
-	counter := &readerCallCounter{StorageDriver: inmemory.New()}
-	if err := counter.PutContent(context.Background(), "/blob", []byte(content)); err != nil {
+	fs := filesystem.New(filesystem.DriverParameters{RootDirectory: t.TempDir(), MaxThreads: 25})
+	// The wrapper exposes only the StorageDriver methods, as storage middleware can do.
+	recorder := &readerCallRecorder{StorageDriver: fs}
+	if err := fs.PutContent(context.Background(), "/blob", []byte(content)); err != nil {
 		t.Fatal(err)
 	}
 	desc := v1.Descriptor{Digest: digest.FromString(content), Size: int64(len(content)), MediaType: "application/octet-stream"}
 	bs := &blobServer{
-		driver:  counter,
+		driver:  recorder,
 		statter: fixedBlobStatter{desc},
 		pathFn:  func(digest.Digest) (string, error) { return "/blob", nil },
 	}
 	w := httptest.NewRecorder()
-	if err := bs.ServeBlob(context.Background(), w, httptest.NewRequest(http.MethodGet, "/", nil), desc.Digest); err != nil {
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.Header.Set("Range", "bytes=2-")
+	if err := bs.ServeBlob(context.Background(), w, r, desc.Digest); err != nil {
 		t.Fatal(err)
 	}
-	if got := w.Body.String(); got != content {
-		t.Errorf("body = %q, want %q", got, content)
+	if got, want := w.Body.String(), content[2:]; got != want {
+		t.Errorf("body = %q, want %q", got, want)
 	}
-	if counter.calls != 1 {
-		t.Errorf("Reader calls = %d, want 1", counter.calls)
+	if len(recorder.offsets) != 1 || recorder.offsets[0] != 2 {
+		t.Errorf("Reader offsets = %v, want [2]", recorder.offsets)
 	}
 }
