@@ -52,13 +52,13 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		// Fallback to serving the content directly.
 	}
 
-	br, err := newFileReader(ctx, bs.driver, path, desc.Size)
+	fr, err := newFileReader(ctx, bs.driver, path, desc.Size)
 	if err != nil {
 		return err
 	}
-	defer br.Close()
+	defer fr.Close()
 
-	var content io.ReadSeeker = br
+	var br io.ReadSeeker = fr
 	// On the filesystem driver, serve a GET from the blob file itself.
 	// fileReader would allocate a buffer of up to fileReaderBufferSize per
 	// GET and report desc.Size as the length, which can come from a stale
@@ -78,7 +78,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		defer rc.Close()
 		// A storage middleware may wrap the reader; ServeBlob then keeps fileReader.
 		if f, ok := rc.(*os.File); ok {
-			content = f
+			br = f
 		}
 	}
 
@@ -94,11 +94,7 @@ func (bs *blobServer) ServeBlob(ctx context.Context, w http.ResponseWriter, r *h
 		w.Header().Set("Content-Type", desc.MediaType)
 	}
 
-	if w.Header().Get("Content-Length") == "" {
-		// Set the content length if not already set.
-		w.Header().Set("Content-Length", fmt.Sprint(desc.Size))
-	}
-
-	http.ServeContent(w, r, desc.Digest.String(), time.Time{}, content)
+	// ServeContent sets Content-Length. A value set here would be sent with a 412.
+	http.ServeContent(w, r, desc.Digest.String(), time.Time{}, br)
 	return nil
 }
