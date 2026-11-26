@@ -122,9 +122,8 @@ func TestAccessLogCountsReadFrom(t *testing.T) {
 }
 
 // TestAccessLogStatusMatchesClient checks, against a net/http server, that the
-// access log shows the status that the client received. The handler sets each
-// status from 100 to 599. The test has no expected status per request: it
-// compares the log with what the client received.
+// access log shows the status that the client received. It also checks that
+// flushing before WriteHeader commits a 200 response.
 func TestAccessLogStatusMatchesClient(t *testing.T) {
 	// The pipe buffers each log line, so the handler's write does not wait for
 	// the test, which reads the line after the response.
@@ -135,19 +134,33 @@ func TestAccessLogStatusMatchesClient(t *testing.T) {
 	defer logReader.Close()
 	defer logWriter.Close()
 	srv := httptest.NewServer(accessLogHandler(logWriter, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("flush") {
+		case "flusher":
+			w.(http.Flusher).Flush()
+		case "controller":
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				t.Errorf("flush: %v", err)
+			}
+		}
 		status, _ := strconv.Atoi(r.URL.Path[1:])
 		w.WriteHeader(status)
 	})))
 	defer srv.Close()
 
 	logs := bufio.NewReader(logReader)
+	paths := []string{"/503?flush=flusher", "/503?flush=controller"}
 	for status := 100; status < 600; status++ {
-		path := fmt.Sprintf("/%d", status)
+		paths = append(paths, fmt.Sprintf("/%d", status))
+	}
+	for _, path := range paths {
 		resp, err := srv.Client().Get(srv.URL + path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
+		if resp.Request.URL.Query().Has("flush") && resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s: client received %d after flush, want 200", path, resp.StatusCode)
+		}
 		line, err := logs.ReadString('\n')
 		if err != nil {
 			t.Fatal(err)

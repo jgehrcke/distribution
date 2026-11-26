@@ -43,6 +43,20 @@ func accessLogHandler(out io.Writer, h http.Handler) http.Handler {
 					return n, err
 				}
 			},
+			Flush: func(next httpsnoop.FlushFunc) httpsnoop.FlushFunc {
+				return func() {
+					next()
+					wroteHeader = true
+				}
+			},
+			FlushError: func(next httpsnoop.FlushErrorFunc) httpsnoop.FlushErrorFunc {
+				return func() error {
+					err := next()
+					// net/http commits the header before it flushes the buffer.
+					wroteHeader = true
+					return err
+				}
+			},
 			ReadFrom: func(next httpsnoop.ReadFromFunc) httpsnoop.ReadFromFunc {
 				return func(src io.Reader) (int64, error) {
 					n, err := next(src)
