@@ -70,6 +70,11 @@ func accessLogHandler(out io.Writer, h http.Handler) http.Handler {
 			},
 		})
 		h.ServeHTTP(w, r)
+		// Middleware may have copied the request, so net/http may never see this form.
+		if form := r.MultipartForm; form != nil && form.RemoveAll() != nil {
+			// Gorilla skips the log entry if cleanup fails.
+			return
+		}
 		_, _ = io.WriteString(out, combinedLogLine(r, u, ts, status, written))
 	})
 }

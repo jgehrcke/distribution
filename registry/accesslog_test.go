@@ -57,6 +57,30 @@ func TestAccessLogMatchesGorilla(t *testing.T) {
 	}
 }
 
+func TestAccessLogRemovesMultipartFiles(t *testing.T) {
+	const body = "--test\r\n" +
+		`Content-Disposition: form-data; name="file"; filename="blob"` + "\r\n\r\nx\r\n--test--\r\n"
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=test")
+	// Middleware passes a request copy. Only the copy gets the parsed form.
+	copied := req.WithContext(t.Context())
+	h := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// Force the one-byte upload onto disk.
+		if err := r.ParseMultipartForm(0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.MultipartForm.RemoveAll() })
+	})
+	accessLogHandler(io.Discard, h).ServeHTTP(httptest.NewRecorder(), copied)
+	f, _, err := copied.FormFile("file")
+	if err == nil {
+		f.Close()
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("opening temporary file after handler returned: got %v, want file removed", err)
+	}
+}
+
 // readerFromRecorder records whether ReadFrom reached the underlying writer.
 type readerFromRecorder struct {
 	*httptest.ResponseRecorder
