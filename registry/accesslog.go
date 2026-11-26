@@ -114,6 +114,15 @@ func combinedLogLine(req *http.Request, u url.URL, ts time.Time, status int, siz
 // strconv.Quote without the outer quotes, except that Gorilla escapes DEL as
 // \u007f where strconv.Quote uses \x7f.
 func quoteLogField(s string) string {
+	// Printable ASCII runs from space (' ') through tilde ('~'), inclusive.
+	// Double quotes and backslashes are printable ASCII, but both need escaping
+	// inside a quoted log field. If all characters are in range and none are
+	// quotes or backslashes, return s directly to avoid allocating a quoted copy.
+	if !strings.ContainsFunc(s, func(r rune) bool {
+		return r < ' ' || r > '~' || r == '"' || r == '\\'
+	}) {
+		return s
+	}
 	parts := strings.Split(s, "\x7f")
 	for i, p := range parts {
 		q := strconv.Quote(p)

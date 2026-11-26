@@ -32,6 +32,7 @@ func TestAccessLogMatchesGorilla(t *testing.T) {
 		{"userinfo", "http://alice@example.com/v2/", "", "", "192.0.2.1:1234", http.StatusOK},
 		{"ipv6", "/v2/", "", "", "[2001:db8::1]:443", http.StatusOK},
 		{"no port", "/v2/", "", "", "192.0.2.1", http.StatusOK},
+		{"ASCII escaping", "/v2/", `a"b`, `c\d`, "192.0.2.1:1234", http.StatusOK},
 		{"escaping", "/v2/%22", "a\"b\\c\td\x7fe\x01\xff", "ü   \U0001F600 \x7f\\x7f", "192.0.2.1:1234", http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
